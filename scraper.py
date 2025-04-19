@@ -1,38 +1,41 @@
 from flask import Flask, request, jsonify
-import cloudscraper, urllib.parse
-from bs4 import BeautifulSoup
+import re, json, urllib.parse
+import cloudscraper, requests
 
 app = Flask(__name__)
 scraper = cloudscraper.create_scraper(
-  browser={'browser':'firefox','platform':'windows','desktop':True}
+    browser={'browser':'firefox','platform':'windows','desktop':True}
 )
 
-@app.route('/offers')
+def codigo_interno(html):
+    m = re.search(r"var\s+g_iCard\s*=\s*([0-9_]+)", html)
+    return m.group(1) if m else None
+
+def fetch_json(url):
+    r = scraper.get(url, timeout=15)
+    return r.json() if r.status_code == 200 else []
+
+@app.route("/offers")
 def offers():
-  carta = request.args.get('card', '')
-  url = ("https://www.ligapokemon.com.br/"
-         "?view=cards/card&card=" + urllib.parse.quote(carta))
-  html = scraper.get(url).text
-  soup = BeautifulSoup(html, 'html.parser')
+    nome = request.args.get("card", "")
+    base = "https://www.ligapokemon.com.br/"
+    page = (base + "?view=cards/card&card=" +
+            urllib.parse.quote(nome))
+    html = scraper.get(page, timeout=15).text
+    cod = codigo_interno(html)
+    if not cod:
+        return jsonify({"error": "card not found", "marketplace": [], "buylist": []})
 
-  vendas = []
-  for tr in soup.select('.marketplace-table tbody tr'):
-      loja = tr.select_one('.marketplace-loja').get_text(strip=True)
-      cond = tr.select_one('.marketplace-condicao').get_text(strip=True)
-      preco= tr.select_one('.marketplace-preco').get_text(strip=True)
-      val  = float(preco.replace('R$','').replace('.','').replace(',','.'))
-      vendas.append({'store': loja, 'condition': cond, 'price': val})
+    mp_url  = f"{base}_json/mp.php?card={cod}"
+    buy_url = f"{base}_json/buy.php?card={cod}"
+    market  = fetch_json(mp_url)
+    buylist = fetch_json(buy_url)
 
-  buys = []
-  for tr in soup.select('.buylist-table tbody tr'):
-      loja = tr.select_one('.buylist-loja').get_text(strip=True)
-      preco= tr.select_one('.buylist-preco').get_text(strip=True)
-      val  = float(preco.replace('R$','').replace('.','').replace(',','.'))
-      buys.append({'store': loja, 'price': val})
+    # cada item já vem com price; só ordenar
+    market.sort(key=lambda x: x["price"])
+    buylist.sort(key=lambda x: x["price"], reverse=True)
+    return jsonify({"marketplace": market, "buylist": buylist})
 
-  vendas.sort(key=lambda x: x['price'])
-  buys.sort(key=lambda x: x['price'], reverse=True)
-  return jsonify({'marketplace': vendas, 'buylist': buys})
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
 
-if __name__ == '__main__':
-  app.run(host='0.0.0.0', port=5000)
