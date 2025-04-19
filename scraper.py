@@ -172,5 +172,4 @@ def not_found(e):
 
 @app.errorhandler(500)
 def server_error(e):
-    return jsonify(error="internal_server_error"), 500
-ajuste regex cards_stock 
+    return jsonify(error="internal_server_error"), 500 
