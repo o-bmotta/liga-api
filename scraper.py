@@ -4,17 +4,19 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 log = logging.getLogger(__name__)
+
+# 1) Criar o cloudscraper para driblar Cloudflare
 scraper = cloudscraper.create_scraper(
     browser={"browser": "firefox", "platform": "windows", "desktop": True}
 )
 
-# regex para cards_stock e cards_editions
-CARDS_STOCK_RE    = re.compile(r"var\s+cards_stock\s*=\s*(\[[^\]]+\]);", re.DOTALL)
-CARDS_EDITIONS_RE = re.compile(r"var\s+cards_editions\s*=\s*(\[[^\]]+\]);", re.DOTALL)
+# 2) Regex aprimoradas (capturam o JSON completo, usando DOTALL)
+CARDS_STOCK_RE    = re.compile(r"var\s+cards_stock\s*=\s*(\[\s*[\s\S]*?\]);", re.DOTALL)
+CARDS_EDITIONS_RE = re.compile(r"var\s+cards_editions\s*=\s*(\[\s*[\s\S]*?\]);", re.DOTALL)
 
-# qualid → condições
+# 3) Mapear qualid → condição(s)
 CONDITION_MAP = {
-    "1": ["M", "NM"],  # Mint preenche M e NM
+    "1": ["M", "NM"],  # Mint → preenche M e NM
     "2": ["NM"],
     "3": ["SP"],
     "4": ["MP"],
@@ -23,11 +25,11 @@ CONDITION_MAP = {
 }
 
 def parse_price(txt: str | None) -> float | None:
-    """Converte '1.099,99'→1099.99 e '3500.00'→3500.0"""
+    """Converte '1.099,99' → 1099.99 e '3500.00' → 3500.0"""
     if not txt:
         return None
     s = txt.replace("R$", "").strip()
-    if "," in s:
+    if "," in s:  # decimal com vírgula
         s = s.replace(".", "").replace(",", ".")
     try:
         return float(s)
@@ -41,24 +43,24 @@ def offers():
         return jsonify(error="card parameter required"), 400
     card = urllib.parse.unquote(raw)
 
-    # buckets iniciais
+    # buckets vazios
     mp = {c: None for c in ["M","NM","SP","MP","HP","D"]}
     bl = {c: None for c in ["M","NM","SP","MP","HP","D"]}
 
-    # marketplace (show=1) → menor por condição
-    html = fetch(card, show=1)
+    # ── marketplace (show=1): menor por condição
+    html = _fetch(card, show=1)
     if html:
-        fill(html, mp, lowest=True)
-        # fallback editions se mp ainda vazio (ex: Metagross)
+        _fill(html, mp, lowest=True)
+        # se ainda vazios, tenta fallback em cards_editions
         if all(v is None for v in mp.values()):
-            fallback_editions(html, mp)
+            _fallback_editions(html, mp)
 
-    # buylist (show=10) → maior por condição
-    html = fetch(card, show=10)
+    # ── buylist (show=10): maior por condição
+    html = _fetch(card, show=10)
     if html:
-        fill(html, bl, lowest=False)
+        _fill(html, bl, lowest=False)
 
-    # build result
+    # valores agregados
     best_bl = max((p for p in bl.values() if p is not None), default=None)
     lows = [p for p in mp.values() if p is not None]
     low = min(lows) if lows else best_bl
@@ -70,7 +72,7 @@ def offers():
         "low": low
     })
 
-def fetch(card: str, *, show: int) -> str | None:
+def _fetch(card: str, *, show: int) -> str | None:
     url = (
         "https://www.ligapokemon.com.br/?view=cards/card"
         f"&card={urllib.parse.quote(card)}&show={show}"
@@ -82,7 +84,7 @@ def fetch(card: str, *, show: int) -> str | None:
         log.warning(f"Erro ao baixar {url}: {e}")
         return None
 
-def fill(html: str, bucket: dict, *, lowest: bool):
+def _fill(html: str, bucket: dict, *, lowest: bool):
     """Preenche bucket usando var cards_stock."""
     m = CARDS_STOCK_RE.search(html)
     if not m:
@@ -103,9 +105,11 @@ def fill(html: str, bucket: dict, *, lowest: bool):
             continue
         for c in conds:
             prev = bucket.get(c)
-            bucket[c] = price if prev is None else (min(prev,price) if lowest else max(prev,price))
+            bucket[c] = price if prev is None else (
+                min(prev, price) if lowest else max(prev, price)
+            )
 
-def fallback_editions(html: str, bucket: dict):
+def _fallback_editions(html: str, bucket: dict):
     """Se não achou em cards_stock, pega price[0].p de cards_editions."""
     m = CARDS_EDITIONS_RE.search(html)
     if not m:
@@ -116,7 +120,6 @@ def fallback_editions(html: str, bucket: dict):
         return
     if not eds or "price" not in eds[0]:
         return
-    # price é um dict com key "0": {"p": "..."}
     p0 = eds[0]["price"].get("0", {}).get("p")
     price = parse_price(p0)
     if price is None:
