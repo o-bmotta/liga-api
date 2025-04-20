@@ -1,6 +1,6 @@
-# scraper.py  – versão 2025‑04‑20
-import re, json, urllib.parse, logging
-from flask import Flask, request, jsonify, render_template
+# scraper.py  – 20‑abr‑2025
+import re, json, urllib.parse, logging, os
+from flask import Flask, request, jsonify
 import cloudscraper
 
 app = Flask(__name__)
@@ -10,32 +10,30 @@ scraper = cloudscraper.create_scraper(
     browser={'browser': 'firefox', 'platform': 'windows', 'desktop': True}
 )
 
-# --- util -------------------------------------------------------
-def _parse_price(raw: str) -> float | None:
-    """
-    Converte '1.099,99'  →  1099.99   e  '999,95' → 999.95
-    """
+# ---------- util -------------------------------------------------
+def _parse_price(raw: str | None) -> float | None:
+    """Converte '1.099,99' -> 1099.99   /   '999,95' -> 999.95"""
     if not raw:
         return None
     txt = raw.replace('R$', '').strip()
-    if ',' in txt:
+    if ',' in txt:                       # há separador decimal brasileiro
         txt = txt.replace('.', '').replace(',', '.')
     return float(txt)
 
-# --- mapeamento de condição ------------------------------------
-QUALITY = {     # id -> rótulo apresentado
-    "1": "M",   # Mint / Nova
-    "2": "NM",  # Near‑Mint
+# ---------- mapeamento de condições -----------------------------
+QUALITY = {           # id  ->  rótulo
+    "1": "M",
+    "2": "NM",
     "3": "SP",
     "4": "MP",
     "5": "HP",
     "6": "D",
 }
 
-# --- rotas ------------------------------------------------------
+# ---------- rotas -----------------------------------------------
 @app.route("/")
-def index():
-    return render_template("index.html")
+def ping():
+    return {"ok": True}
 
 @app.route("/offers")
 def offers():
@@ -46,63 +44,64 @@ def offers():
     result = {
         "card": card,
         "marketplace": {q: None for q in QUALITY.values()},
-        "buylist":      {q: None for q in QUALITY.values()},
+        "buylist":     {q: None for q in QUALITY.values()},
     }
 
-    # Marketplace  (show=1)
-    html_mkt = _fetch(card, show=1)
-    if html_mkt:
-        _fill_prices(html_mkt, result["marketplace"], lowest=True)
+    # marketplace  (show=1) – menor preço por condição
+    html = _fetch(card, show=1)
+    if html:
+        _fill_marketplace(html, result["marketplace"])
 
-    # Buy‑list     (show=10)
-    html_buy = _fetch(card, show=10)
-    if html_buy:
-        _fill_prices(html_buy, result["buylist"], lowest=False)
+    # buy‑list (show=10) – maior preço por condição
+    html = _fetch(card, show=10)
+    if html:
+        _fill_buylist(html, result["buylist"])
 
-    # campos agregados que sua planilha usa
-    result["lowest_marketplace"] = min(
-        p for p in result["marketplace"].values() if p is not None
-    ) if any(result["marketplace"].values()) else None
+    # agregados que sua planilha usa
+    mp_vals = [p for p in result["marketplace"].values() if p]
+    bl_vals = [p for p in result["buylist"].values() if p]
 
-    result["highest_buylist"] = max(
-        p for p in result["buylist"].values() if p is not None
-    ) if any(result["buylist"].values()) else None
+    result["lowest_marketplace"] = min(mp_vals) if mp_vals else None
+    result["highest_buylist"]   = max(bl_vals) if bl_vals else None
 
     return jsonify(result)
 
-# --- helpers ----------------------------------------------------
-def _fetch(card_name: str, show: int) -> str | None:
+# ---------- helpers ---------------------------------------------
+def _fetch(card: str, *, show: int) -> str | None:
     url = (
         "https://www.ligapokemon.com.br/"
-        f"?view=cards/card&card={urllib.parse.quote(card_name)}&show={show}"
+        f"?view=cards/card&card={urllib.parse.quote(card)}&show={show}"
     )
-    r = scraper.get(url)
+    r = scraper.get(url, timeout=25)
     return r.text if r.status_code == 200 else None
 
-VAR_CARDS_REGEX = re.compile(r"var\s+cards_stock\s*=\s*(\[[^\]]+\]);", re.DOTALL)
+RE_STOCK = re.compile(r"var\s+cards_stock\s*=\s*(\[[^\]]+\]);", re.DOTALL)
 
-def _fill_prices(html: str, bucket: dict, *, lowest: bool):
-    """
-    Atualiza o dict bucket → condição:preço
-    lowest=True   → armazena o menor preço para cada condição.
-    lowest=False  → armazena o MAIOR  preço (buy‑list).
-    """
-    m = VAR_CARDS_REGEX.search(html)
+def _fill_marketplace(html: str, bucket: dict[str, float | None]) -> None:
+    m = RE_STOCK.search(html)
     if not m:
         return
-    data = json.loads(m.group(1))
+    items = json.loads(m.group(1))
+    for it in items:
+        cond = QUALITY.get(str(it.get("qualid")))
+        price = _parse_price(it.get("precoFinal") or it.get("preco"))
+        if cond and price is not None:
+            bucket[cond] = price if bucket[cond] is None else min(bucket[cond], price)
 
-    for item in data:
-        # precoFinal preferencial, senão preco
-        raw = item.get("precoFinal") or item.get("preco")
-        price = _parse_price(raw)
-        qualid = str(item.get("qualid") or item.get("q") or "")
-        cond = QUALITY.get(qualid)
-        if price is None or cond is None:
+def _fill_buylist(html: str, bucket: dict[str, float | None]) -> None:
+    m = RE_STOCK.search(html)
+    if not m:
+        return
+    items = json.loads(m.group(1))
+    for it in items:
+        base = _parse_price(it.get("base"))
+        qmap = it.get("q", {})
+        if base is None or not isinstance(qmap, dict):
             continue
-
-        existing = bucket[cond]
-        if existing is None:
-            bucket[cond] = price
-        else:
-            bucket[cond] = min(existing, price) if lowest else max(existing, price)
+        for qid, perc in qmap.items():
+            cond = QUALITY.get(str(qid))
+            if not cond:
+                continue
+            buy_price = round(base * perc / 100, 2)
+            prev = bucket[cond]
+            bucket[cond] = buy_price if prev is None else max(prev, buy_price)
