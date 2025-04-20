@@ -1,7 +1,4 @@
 Flask==3.1.0
 cloudscraper==1.2.71
 beautifulsoup4==4.12.3
-# … your other dependencies …
-
-# Add this:
 gunicorn==20.1.0
