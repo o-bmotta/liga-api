@@ -1,4 +1,4 @@
-# scraper.py — 20‑abr‑2025 (v2 hot‑fix)
+# scraper.py  – 20 Abr 2025
 import re, json, urllib.parse, logging
 from flask import Flask, request, jsonify
 import cloudscraper
@@ -7,105 +7,94 @@ app = Flask(__name__)
 log = logging.getLogger(__name__)
 
 scraper = cloudscraper.create_scraper(
-    browser={'browser': 'firefox', 'platform': 'windows', 'desktop': True}
+    browser={"browser": "firefox", "platform": "windows", "desktop": True}
 )
 
-# ---------- regex que captura os 3 blocos JS --------------------
-RE_QUALITY = re.compile(r"var\s+dataQuality\s*=\s*(\[[^\]]+])", re.DOTALL)
-RE_STOCK   = re.compile(r"var\s+cards_stock\s*=\s*(\[[^\]]+])", re.DOTALL)
-
-# ---------- utils ----------------------------------------------
-def _parse_price(raw: str | None) -> float | None:
-    if not raw:
+# --- util -------------------------------------------------------
+def _parse_price(txt: str | None) -> float | None:
+    if not txt:
         return None
-    txt = raw.replace('R$', '').strip()
-    if ',' in txt:                       # pt‑BR
-        txt = txt.replace('.', '').replace(',', '.')
+    txt = txt.replace("R$", "").strip()
+    if "," in txt:
+        txt = txt.replace(".", "").replace(",", ".")
     try:
         return float(txt)
     except ValueError:
         return None
 
-# ---------- rotas ----------------------------------------------
-@app.route("/")
-def ping():
-    return {"ok": True}
+QUALITY = {
+    "1": "M",   # Mint
+    "2": "NM",  # Near‑Mint
+    "3": "SP",
+    "4": "MP",
+    "5": "HP",
+    "6": "D",
+}
 
+VAR_REGEX = re.compile(r"var\s+cards_stock\s*=\s*(\[[\s\S]*?\]);")
+
+# ----------------------------------------------------------------
 @app.route("/offers")
 def offers():
     card = request.args.get("card", "").strip()
     if not card:
         return jsonify(error="card parameter required"), 400
 
-    html_mkt = _fetch(card, show=1)      # Marketplace
-    html_buy = _fetch(card, show=10)     # Buy‑list
-
-    if not html_mkt and not html_buy:
-        return jsonify(error="card not found", card=card), 404
-
-    # ----- mapa dinâmico id->sigla (M, NM, …) -------------------
-    quality_map = _build_quality_map(html_mkt or html_buy)
-    if not quality_map:
-        return jsonify(error="quality map not found"), 500
-
-    # cria dicionários já com todas as siglas
-    bucket_mkt = {sig: None for sig in quality_map.values()}
-    bucket_buy = {sig: None for sig in quality_map.values()}
-
-    if html_mkt:
-        _fill_prices(html_mkt, quality_map, bucket_mkt, lowest=True)
-    if html_buy:
-        _fill_prices(html_buy, quality_map, bucket_buy, lowest=False)
-
-    res = {
+    out = {
         "card": card,
-        "marketplace": bucket_mkt,
-        "buylist":     bucket_buy,
-        "lowest_marketplace":
-            min(p for p in bucket_mkt.values() if p is not None)
-            if any(bucket_mkt.values()) else None,
-        "highest_buylist":
-            max(p for p in bucket_buy.values() if p is not None)
-            if any(bucket_buy.values()) else None,
+        "marketplace": {q: None for q in QUALITY.values()},
+        "buylist":     {q: None for q in QUALITY.values()},
     }
-    return jsonify(res)
 
-# ---------- helpers --------------------------------------------
-def _fetch(card: str, *, show: int) -> str | None:
+    _scrape(card, 1, out["marketplace"], lowest=True)   # marketplace
+    _scrape(card,10, out["buylist"],      lowest=False) # buylist
+
+    # agregados para facilitar a planilha
+    mp_vals = [v for v in out["marketplace"].values() if v is not None]
+    bl_vals = [v for v in out["buylist"].values()      if v is not None]
+    out["lowest_marketplace"] = min(mp_vals) if mp_vals else None
+    out["highest_buylist"]    = max(bl_vals) if bl_vals else None
+    return jsonify(out)
+
+# ----------------------------------------------------------------
+def _scrape(card: str, show: int, bucket: dict, *, lowest: bool):
     url = (
         "https://www.ligapokemon.com.br/"
         f"?view=cards/card&card={urllib.parse.quote(card)}&show={show}"
     )
-    r = scraper.get(url, timeout=25)
-    return r.text if r.status_code == 200 else None
+    r = scraper.get(url)
+    if r.status_code != 200:
+        log.warning("LigaPokemon devolveu %s em %s", r.status_code, url)
+        return
 
-def _build_quality_map(html: str | None) -> dict[str, str]:
-    if not html:
-        return {}
-    m = RE_QUALITY.search(html)
-    if not m:
-        return {}
-    arr = json.loads(m.group(1))
-    return {str(it["id"]): it["acron"] for it in arr}
-
-def _fill_prices(
-    html: str,
-    qmap: dict[str, str],
-    bucket: dict[str, float | None],
-    *,
-    lowest: bool,
-) -> None:
-    m = RE_STOCK.search(html)
+    m = VAR_REGEX.search(r.text)
     if not m:
         return
     items = json.loads(m.group(1))
+
     for it in items:
-        cond   = qmap.get(str(it.get("qualid")))
-        price  = _parse_price(it.get("precoFinal") or it.get("preco"))
+        # --- marketplace (tem 'preco' ou 'precoFinal') -------------
+        raw = it.get("precoFinal") or it.get("preco")
+        qualid = str(it.get("qualid") or "")
+        cond   = QUALITY.get(qualid)
+        price  = _parse_price(raw)
+
+        # --- buylist (não tem preco, mas tem base + q{}) -----------
+        if price is None and it.get("base") and isinstance(it.get("q"), dict):
+            base = _parse_price(it["base"])
+            for q_id, pct in it["q"].items():
+                cond2 = QUALITY.get(str(q_id))
+                if cond2 and base:
+                    price2 = round(base * pct / 100, 2)
+                    _store(bucket, cond2, price2, lowest)
+            continue
+
         if cond and price is not None:
-            prev = bucket[cond]
-            bucket[cond] = (
-                price if prev is None
-                else min(prev, price) if lowest
-                else max(prev, price)
-            )
+            _store(bucket, cond, price, lowest)
+
+def _store(bucket: dict, cond: str, value: float, lowest: bool):
+    current = bucket[cond]
+    if current is None:
+        bucket[cond] = value
+    else:
+        bucket[cond] = min(current, value) if lowest else max(current, value)
