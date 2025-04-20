@@ -1,115 +1,176 @@
-# scraper.py  – 20‑abr‑2025  versão estável
-import re, json, urllib.parse, logging
-from flask import Flask, request, jsonify
+"""
+scraper.py  –  Liga Pokémon ⇄ Google Sheets
+Rodando em Flask + Cloudflare Bypass (cloudscraper)
+"""
+
+import json, logging, re, urllib.parse
 import cloudscraper
+from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
-log = logging.getLogger(__name__)
 
+# 1) ─────────── Cloudflare bypass
 scraper = cloudscraper.create_scraper(
     browser={"browser": "firefox", "platform": "windows", "desktop": True}
 )
 
-# ---------- util ----------------------------------------------------------
-def _parse_price(raw: str | None) -> float | None:
-    """Converte '1.099,99' ou '1099.99' em 1099.99   (None se falhar)"""
-    if not raw:
-        return None
-    txt = raw.replace("R$", "").strip()
-    # se existir vírgula, significa que ela é separador decimal
-    if "," in txt:
-        txt = txt.replace(".", "").replace(",", ".")
-    try:
-        return float(txt)
-    except ValueError:
-        return None
+# 2) ─────────── Expressões regulares
+CARDS_STOCK_REGEX = re.compile(r"var\s+cards_stock\s*=\s*(\[.*?]);", re.DOTALL)
 
+# Nos dadosQuality da página:
+#  id 2 = NM / 3 = SP / 4 = MP / 5 = HP / 6 = D
+CONDITION_CODES = {
+    "2": "NM",
+    "3": "SP",
+    "4": "MP",
+    "5": "HP",
+    "6": "D",
+}
 
-# ---------- rotas ---------------------------------------------------------
+# 3) ─────────── Rota raiz (formulário simples opcional)
 @app.route("/")
-def health():
-    return "Liga‑API OK"
+def index():
+    return render_template("index.html")  # coloque um HTML ou remova a chamada
 
+# 4) ─────────── API
 @app.route("/offers")
-def offers():
-    card = request.args.get("card", "").strip()
-    if not card:
-        return jsonify(error="card parameter required"), 400
+def preco():
+    """
+    /offers?card=Mew+Star+(14/29)
 
-    # estrutura‑resultado
-    bucket_mkt = {}   # loja vendendo → menor preço por condição
-    bucket_buy = {}   # buylist        → maior preço por condição
-
-    html_mkt = _fetch(card, show=1)
-    if html_mkt:
-        _fill_prices(html_mkt, bucket_mkt, lowest=True)
-
-    html_buy = _fetch(card, show=10)
-    if html_buy:
-        _fill_prices(html_buy, bucket_buy, lowest=False)
-
-    # monta resposta final
-    all_conds = sorted({"M", "NM", "SP", "MP", "HP", "D"})
-    resp = {
-        "card": card,
-        "marketplace": {c: bucket_mkt.get(c) for c in all_conds},
-        "buylist":     {c: bucket_buy.get(c) for c in all_conds},
-        "lowest_marketplace":
-            min(bucket_mkt.values()) if bucket_mkt else None,
-        "highest_buylist":
-            max(bucket_buy.values()) if bucket_buy else None,
+    Resposta:
+    {
+      "card": "Mew Star (14/29)",
+      "marketplace_prices": { "NM": 1259.10, "SP": null, … },
+      "buylist_best_price": 3500.0,
+      "low": 1259.10
     }
-    return jsonify(resp)
+    """
+    carta_raw = request.args.get("card", "")
+    if not carta_raw:
+        return jsonify(error="card_name_required"), 400
 
+    nome_carta = urllib.parse.unquote(carta_raw)
 
-# ---------- helpers -------------------------------------------------------
-def _fetch(name: str, show: int) -> str | None:
-    url = (
-        "https://www.ligapokemon.com.br/"
-        f"?view=cards/card&card={urllib.parse.quote(name)}&show={show}"
+    result = {
+        "card": nome_carta,
+        "marketplace_prices": {c: None for c in ["NM", "SP", "MP", "HP", "D"]},
+        "buylist_best_price": None,
+    }
+
+    # ── 4.1 marketplace (lojas vendendo)  ─────────────────────────────
+    html_market = get_html(nome_carta, show=1)
+    if html_market:
+        mp_prices = extract_marketplace_prices(html_market)
+        result["marketplace_prices"].update(mp_prices)
+
+    # ── 4.2 buylist (lojas comprando)  ────────────────────────────────
+    html_buy = get_html(nome_carta, show=10)
+    if html_buy:
+        result["buylist_best_price"] = extract_buylist_price(html_buy)
+
+    # menor preço geral – útil para Sheets ordenar
+    lowest = min(
+        (p for p in result["marketplace_prices"].values() if p is not None),
+        default=None,
     )
-    r = scraper.get(url, timeout=20)
-    return r.text if r.status_code == 200 else None
+    result["low"] = lowest if lowest is not None else result["buylist_best_price"]
 
-VAR_STOCK = re.compile(r"var\s+cards_stock\s*=\s*(\[[^\]]+]);", re.DOTALL)
-VAR_QUAL  = re.compile(r"var\s+dataQuality\s*=\s*(\[[^\]]+]);", re.DOTALL)
+    if result["low"] is None:
+        return jsonify(error="price_not_found", card=nome_carta), 404
 
-def _get_quality_map(html: str) -> dict[str, str]:
+    return jsonify(result)
+
+
+# 5) ─────────── Helpers ───────────────────────────────────────────────
+def get_html(card_name: str, show: int) -> str | None:
+    url = (
+        "https://www.ligapokemon.com.br/?view=cards/card"
+        f"&card={urllib.parse.quote(card_name)}&show={show}"
+    )
+    try:
+        r = scraper.get(url, timeout=20)
+        return r.text if r.status_code == 200 else None
+    except Exception as e:
+        logging.warning(f"Erro ao baixar página ({url}): {e}")
+        return None
+
+
+def extract_marketplace_prices(html: str) -> dict[str, float]:
     """
-    Constrói dinamicamente o mapa id→acron ('1'→'M', '2'→'NM' …)
-    para evitar disparidades entre marketplace e buy‑list.
+    Lê cards_stock na aba show=1 e devolve o MENOR preço por condição.
     """
-    m = VAR_QUAL.search(html)
+    prices = {}
+    m = CARDS_STOCK_REGEX.search(html)
     if not m:
-        return {}
-    arr = json.loads(m.group(1))
-    out = {}
-    for q in arr:
-        # alguns sites escrevem "M / NM" – tratamos como 'M' **e** 'NM'
-        acr = q.get("acron", "").replace(" ", "").split("/")
-        for a in acr:
-            if a:                       # 'M', 'NM' …
-                out[str(q["id"])] = a
-    return out
+        return prices
 
-def _fill_prices(html: str, bucket: dict, *, lowest: bool):
-    qual_map = _get_quality_map(html)
-    m = VAR_STOCK.search(html)
-    if not m:
-        return
-    data = json.loads(m.group(1))
+    try:
+        stock = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return prices
 
-    for item in data:
-        raw = item.get("precoFinal") or item.get("preco") or item.get("base")
-        price = _parse_price(raw)
-        # 'qualid' no marketplace, 'q' na buylist
-        qid   = str(item.get("qualid") or item.get("q") or "")
-        cond  = qual_map.get(qid)
-        if price is None or cond is None:
+    for item in stock:
+        cond_code = str(item.get("qualid", ""))
+        cond = CONDITION_CODES.get(cond_code)
+        if not cond:
             continue
 
-        # agrupa menor (loja) ou maior (buy‑list)
-        if cond not in bucket:
-            bucket[cond] = price
-        else:
-            bucket[cond] = min(bucket[cond], price) if lowest else max(bucket[cond], price)
+        # campo de preço pode ser 'precoFinal' ou 'preco'
+        price_str = (
+            item.get("precoFinal")
+            or item.get("preco")
+            or item.get("base")  # fallback
+        )
+        if not price_str:
+            continue
+
+        try:
+            price = float(price_str.replace(".", "").replace(",", "."))
+        except ValueError:
+            continue
+
+        # guarda o menor preço por condição
+        if cond not in prices or price < prices[cond]:
+            prices[cond] = price
+
+    return prices
+
+
+def extract_buylist_price(html: str) -> float | None:
+    """
+    Lê cards_stock na aba show=10 e devolve o MAIOR preço de compra.
+    """
+    m = CARDS_STOCK_REGEX.search(html)
+    if not m:
+        return None
+
+    try:
+        stock = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+    highest = None
+    for item in stock:
+        price_str = item.get("precoFinal") or item.get("base")
+        if not price_str:
+            continue
+        try:
+            price = float(price_str.replace(".", "").replace(",", "."))
+        except ValueError:
+            continue
+        if highest is None or price > highest:
+            highest = price
+    return highest
+
+
+# 6) ─────────── Tratamento de erros HTTP  ────────────────────────────
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify(error="not_found"), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify(error="internal_server_error"), 500
+
